@@ -4,6 +4,7 @@
 #   ./scripts/anchor-site.sh check
 #   ./scripts/anchor-site.sh publish "commit message"
 #   ./scripts/anchor-site.sh sitemap        regenerate sitemap.xml (publish does this too)
+#   ./scripts/anchor-site.sh validate       offline PR checks, no fetch or live comparison
 #
 # Must run on the Mac itself (needs network and the keychain credential helper).
 # The sandboxed Claude VM has no network; git fetch/push there fail with a 403
@@ -92,7 +93,7 @@ cmd_sitemap() {
   ok "sitemap.xml regenerated ($(grep -c '<loc>' sitemap.xml) pages)"
 }
 
-verify_sitemap() {
+verify_sitemap_local() {
   # Fails if sitemap.xml is missing or does not match what the generator would
   # produce from the current tree (new page, removed page, or a page edited
   # since its lastmod). Fix: ./scripts/anchor-site.sh sitemap
@@ -103,6 +104,10 @@ verify_sitemap() {
     return 1
   fi
   ok "sitemap.xml matches the current pages ($(grep -c '<loc>' sitemap.xml) pages)"
+}
+
+verify_sitemap() {
+  verify_sitemap_local || return 1
   local live_sum local_sum
   live_sum=$(curl -fsS -m 25 "$LIVE/sitemap.xml" 2>/dev/null | shasum -a 256 | cut -d' ' -f1)
   local_sum=$(shasum -a 256 sitemap.xml | cut -d' ' -f1)
@@ -152,17 +157,19 @@ cmd_check() {
 cmd_publish() {
   local msg="${1:-}"
   [ -z "$msg" ] && { bad 'usage: anchor-site.sh publish "commit message"'; return 1; }
+  local branch
+  branch=$($GIT symbolic-ref --quiet --short HEAD) || { bad 'publish requires a branch'; return 1; }
 
   clear_stale_locks
   $GIT fetch origin --quiet 2>&1 || { bad "git fetch failed"; return 1; }
-  if [ "$($GIT rev-list --count main..origin/main)" -gt 0 ]; then
-    bad "REFUSING to publish: local is behind origin. Run 'check' and reconcile first."; return 1
+  if ! $GIT merge-base --is-ancestor origin/main HEAD; then
+    bad "REFUSING to publish: branch is missing changes from origin/main. Reconcile first."; return 1
   fi
 
   # sitemap.xml is derived from the page list; lastmod comes from git, so
   # regenerate it AFTER committing page edits and fold it into the same push.
   if [ -n "$($GIT status --porcelain)" ]; then
-    $GIT add -A && $GIT commit -m "$msg" -m "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>" || { bad "commit failed"; return 1; }
+    $GIT add -A && $GIT commit -m "$msg" || { bad "commit failed"; return 1; }
     ok "committed"
   else warn "nothing to commit"; fi
 
@@ -172,7 +179,11 @@ cmd_publish() {
     ok "sitemap.xml regenerated and committed"
   else ok "sitemap.xml already current"; fi
 
-  $GIT push origin main 2>&1 | tail -2 || { bad "PUSH FAILED - the commit exists locally but the site is NOT updated"; return 1; }
+  $GIT push -u origin "$branch" 2>&1 | tail -2 || { bad "PUSH FAILED - the commit exists locally but was not published"; return 1; }
+  if [ "$branch" != main ]; then
+    ok "pushed PR branch $branch; open a pull request and wait for website-checks before merge"
+    return 0
+  fi
   [ "$($GIT rev-list --count origin/main..main)" -eq 0 ] || { bad "push did not land; still ahead"; return 1; }
   ok "pushed to origin/main"
 
@@ -189,7 +200,8 @@ cmd_publish() {
 
 case "${1:-check}" in
   check)   cmd_check ;;
+  validate) python3 -B scripts/validate-site.py && verify_sitemap_local ;;
   publish) shift; cmd_publish "${1:-}" ;;
   sitemap) cmd_sitemap ;;
-  *) echo "usage: $0 {check|publish \"message\"|sitemap}"; exit 2 ;;
+  *) echo "usage: $0 {check|validate|publish \"message\"|sitemap}"; exit 2 ;;
 esac
